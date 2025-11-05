@@ -14,7 +14,7 @@
 - `animetrace_plugin/plugin.py`：Tool 实现与插件注册、图片解析与输出格式化、配置 Schema
 - `animetrace_plugin/trace_client.py`：AnimeTrace API 客户端（httpx、重试/退避、缓存、响应格式化）
 - `animetrace_plugin/_manifest.json`：插件清单（components=tool: anime_trace_search）
-- `animetrace_plugin/animetrace_demo/`：接口调用与示例数据
+- `animetrace_plugin/animetrace_demo/`：接口调用与示例数据 由[晴空](https://github.com/XXXxx7258)提供
 
 ## 安装与启用
 1) 将 `animetrace_plugin/` 放入 MaiBot 插件目录（通常为 `plugins/`）
