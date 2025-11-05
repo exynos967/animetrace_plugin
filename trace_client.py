@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import httpx  # type: ignore
@@ -28,10 +31,13 @@ class AnimeTraceClient:
     支持 url/base64/file 三种输入（优先使用 url/base64）。
     """
 
-    def __init__(self, endpoint: str, timeout: float = 15.0) -> None:
+    def __init__(self, endpoint: str, timeout: float = 15.0, *, max_retries: int = 2, cache_size: int = 64) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.logger = get_logger("animetrace_client")
+        self._max_retries = max(0, int(max_retries))
+        self._url_cache: OrderedDict[str, str] = OrderedDict()
+        self._cache_size = max(0, int(cache_size))
 
     async def search(
         self,
@@ -74,15 +80,8 @@ class AnimeTraceClient:
                 "缺少 httpx 依赖，请安装 httpx 以使用 AnimeTrace 请求"
             )
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                if files:
-                    resp = await client.post(self.endpoint, data=payload, files=files)
-                else:
-                    resp = await client.post(self.endpoint, json=payload)
-            except httpx.HTTPError as e:  # type: ignore
-                raise AnimeTraceError(f"网络异常: {e}")
-
+        async with httpx.AsyncClient(timeout=self.timeout, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)) as client:  # type: ignore
+            resp = await self._post_with_retries(client, payload, files)
             # info 日志：状态码与内容长度
             try:
                 self.logger.info(
@@ -92,29 +91,50 @@ class AnimeTraceClient:
                 pass
 
             if resp.status_code >= 400:
-                err_excerpt = ""
-                try:
-                    txt = resp.text[:200]
-                    try:
-                        j = resp.json()
-                        msg = j.get("message") or j.get("msg") or ""
-                        code = j.get("code")
-                        if msg:
-                            err_excerpt = f" code={code} msg={msg}"
-                        else:
-                            err_excerpt = f" body={txt}"
-                    except Exception:
-                        err_excerpt = f" body={txt}"
-                except Exception:
-                    pass
-                raise AnimeTraceError(
-                    f"HTTP 错误{err_excerpt}", status=resp.status_code
-                )
+                err_excerpt = await self._extract_error_excerpt(resp)
+                raise AnimeTraceError(f"HTTP 错误{err_excerpt}", status=resp.status_code)
 
             try:
                 return resp.json()  # type: ignore
             except Exception:
                 raise AnimeTraceError("响应解析失败")
+
+    async def _post_with_retries(self, client, payload: Dict[str, Any], files) -> "httpx.Response":  # type: ignore
+        """POST with basic retry on 429/5xx with exponential backoff."""
+        attempt = 0
+        while True:
+            try:
+                if files:
+                    resp = await client.post(self.endpoint, data=payload, files=files)
+                else:
+                    resp = await client.post(self.endpoint, json=payload)
+                if resp.status_code in (429,) or resp.status_code >= 500:
+                    if attempt < self._max_retries:
+                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        attempt += 1
+                        continue
+                return resp
+            except httpx.HTTPError as e:  # type: ignore
+                if attempt < self._max_retries:
+                    await asyncio.sleep(0.4 * (2 ** attempt))
+                    attempt += 1
+                    continue
+                raise AnimeTraceError(f"网络异常: {e}")
+
+    async def _extract_error_excerpt(self, resp) -> str:
+        try:
+            txt = resp.text[:200]
+            try:
+                j = resp.json()
+                msg = j.get("message") or j.get("msg") or ""
+                code = j.get("code")
+                if msg:
+                    return f" code={code} msg={msg}"
+                return f" body={txt}"
+            except Exception:
+                return f" body={txt}"
+        except Exception:
+            return ""
 
     def _build_log_payload(
         self, payload: Dict[str, Any], files, file_bytes: Optional[bytes]
@@ -134,23 +154,42 @@ class AnimeTraceClient:
         """下载图片字节，用于 URL → base64 或文件上传路径。"""
         if httpx is None:
             raise AnimeTraceError("缺少 httpx 依赖，无法下载图片")
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                resp = await client.get(url)
-                self.logger.info(
-                    f"[AnimeTrace] GET {url} status={resp.status_code} len={len(resp.content)}"
-                )
-                if resp.status_code >= 400:
-                    raise AnimeTraceError("下载失败", status=resp.status_code)
-                return resp.content
-            except httpx.HTTPError as e:  # type: ignore
-                raise AnimeTraceError(f"下载异常: {e}")
+        async with httpx.AsyncClient(timeout=self.timeout, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)) as client:  # type: ignore
+            attempt = 0
+            while True:
+                try:
+                    resp = await client.get(url)
+                    self.logger.info(
+                        f"[AnimeTrace] GET {url} status={resp.status_code} len={len(resp.content)}"
+                    )
+                    if resp.status_code >= 400:
+                        if resp.status_code in (429,) or resp.status_code >= 500:
+                            if attempt < self._max_retries:
+                                await asyncio.sleep(0.4 * (2 ** attempt))
+                                attempt += 1
+                                continue
+                        raise AnimeTraceError("下载失败", status=resp.status_code)
+                    return resp.content
+                except httpx.HTTPError as e:  # type: ignore
+                    if attempt < self._max_retries:
+                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        attempt += 1
+                        continue
+                    raise AnimeTraceError(f"下载异常: {e}")
 
     async def url_to_base64(self, url: str) -> str:
+        # 简单 LRU 缓存，减少重复下载
+        if url in self._url_cache:
+            b64 = self._url_cache.pop(url)
+            self._url_cache[url] = b64
+            return b64
         data = await self.download_bytes(url)
-        import base64
-
-        return base64.b64encode(data).decode("ascii")
+        b64 = base64.b64encode(data).decode("ascii")
+        if self._cache_size > 0:
+            self._url_cache[url] = b64
+            if len(self._url_cache) > self._cache_size:
+                self._url_cache.popitem(last=False)
+        return b64
 
     # --------- 文本格式化工具 ---------
     @staticmethod
@@ -180,11 +219,8 @@ class AnimeTraceClient:
     def format_response_text(
         resp: Dict[str, Any], *, min_similarity: float = 0.0
     ) -> str:
-        """将 AnimeTrace 响应压缩为一行可读文本。
-
-        兼容未知字段结构：优先在 data/results 列表中查找；否则回退到整体 JSON 文本（截断）。
-        """
-        # 优先处理通用 code/message 语义
+        """将 AnimeTrace 响应压缩为一行可读文本。"""
+        # 通用错误码优先
         try:
             code = resp.get("code")
             if isinstance(code, int) and code not in (0, 200, 17720):
@@ -193,93 +229,75 @@ class AnimeTraceClient:
                 return str(zh_msg or msg or f"错误代码: {code}")
         except Exception:
             pass
-        # 归一化阈值到百分比
-        thr = (
-            AnimeTraceClient._norm_similarity(
-                AnimeTraceClient._as_float(min_similarity)
-            )
-            or 0.0
-        )
 
-        candidates: list[dict[str, Any]] = []
-        data = resp.get("data")
-        if isinstance(data, list):
-            candidates = [x for x in data if isinstance(x, dict)]
-        elif isinstance(data, dict):
-            if isinstance(data.get("results"), list):
-                candidates = [x for x in data.get("results", []) if isinstance(x, dict)]
-            elif isinstance(data.get("result"), list):
-                candidates = [x for x in data.get("result", []) if isinstance(x, dict)]
-
-        if not candidates and isinstance(resp.get("results"), list):
-            candidates = [x for x in resp.get("results", []) if isinstance(x, dict)]
-
-        # 动态选择摘要策略
-        def parse_item(item: dict[str, Any]) -> tuple[float, str]:
-            # 1) 角色结果（animetrace_demo 中的 data[0].character 列表）
-            if isinstance(item.get("character"), list) and item.get("character"):
-                chars = item.get("character")
-                top = []
-                for ch in chars[:3]:
-                    try:
-                        w = ch.get("work")
-                        c = ch.get("character")
-                        if w or c:
-                            top.append(f"{w or ''}:{c or ''}".strip(":"))
-                    except Exception:
-                        continue
-                summary = (
-                    "角色Top" + str(len(top)) + ": " + "; ".join(top)
-                    if top
-                    else "角色信息返回"
-                )
-                # 无相似度时返回 0 作为排序
-                return 0.0, summary
-
-            # 2) 通用相似度/标题结果
-            title = (
-                item.get("title")
-                or item.get("name")
-                or item.get("subject")
-                or item.get("source")
-                or "(未知)"
-            )
-            similarity = (
-                AnimeTraceClient._as_float(item.get("similarity"))
-                or AnimeTraceClient._as_float(item.get("score"))
-                or AnimeTraceClient._as_float(item.get("sim"))
-                or 0.0
-            )
-            sim_pct = AnimeTraceClient._norm_similarity(similarity) or 0.0
-            extra = []
-            for key in ("episode", "part", "chapter", "time"):
-                if item.get(key):
-                    extra.append(f"{key}:{item.get(key)}")
-            if item.get("url"):
-                extra.append(str(item.get("url")))
-            if item.get("site"):
-                extra.append(str(item.get("site")))
-            summary = f"{title}  相似度:{sim_pct:.1f}%" + (
-                f"  ({' '.join(extra)})" if extra else ""
-            )
-            return sim_pct, summary
+        thr = AnimeTraceClient._norm_similarity(AnimeTraceClient._as_float(min_similarity)) or 0.0
+        candidates = AnimeTraceClient._extract_candidates(resp)
 
         if candidates:
             best_text = None
             best_score = -1.0
             for it in candidates:
-                score, text = parse_item(it)
+                score, text = AnimeTraceClient._parse_candidate_item(it)
                 if score >= thr and score > best_score:
                     best_score, best_text = score, text
             if best_text:
                 return best_text
 
-        # 回退：取 message / msg 字段或整体 JSON 截断
         for k in ("message", "msg"):
             if resp.get(k):
                 return str(resp[k])
         try:
-            js = json.dumps(resp, ensure_ascii=False)[:800]
-            return js
+            return json.dumps(resp, ensure_ascii=False)[:800]
         except Exception:  # pragma: no cover
             return str(resp)
+
+    @staticmethod
+    def _extract_candidates(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+        data = resp.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        if isinstance(data, dict):
+            for key in ("results", "result"):
+                lst = data.get(key)
+                if isinstance(lst, list):
+                    return [x for x in lst if isinstance(x, dict)]
+        if isinstance(resp.get("results"), list):
+            return [x for x in resp.get("results", []) if isinstance(x, dict)]
+        return []
+
+    @staticmethod
+    def _parse_candidate_item(item: Dict[str, Any]) -> Tuple[float, str]:
+        # 角色候选
+        if isinstance(item.get("character"), list) and item.get("character"):
+            chars = item.get("character")
+            top = []
+            for ch in chars[:3]:
+                try:
+                    w = ch.get("work")
+                    c = ch.get("character")
+                    if w or c:
+                        top.append(f"{w or ''}:{c or ''}".strip(":"))
+                except Exception:
+                    continue
+            summary = "角色Top" + str(len(top)) + ": " + "; ".join(top) if top else "角色信息返回"
+            return 0.0, summary
+
+        # 通用候选
+        title = item.get("title") or item.get("name") or item.get("subject") or item.get("source") or "(未知)"
+        similarity = (
+            AnimeTraceClient._as_float(item.get("similarity"))
+            or AnimeTraceClient._as_float(item.get("score"))
+            or AnimeTraceClient._as_float(item.get("sim"))
+            or 0.0
+        )
+        sim_pct = AnimeTraceClient._norm_similarity(similarity) or 0.0
+        extra = []
+        for key in ("episode", "part", "chapter", "time"):
+            if item.get(key):
+                extra.append(f"{key}:{item.get(key)}")
+        if item.get("url"):
+            extra.append(str(item.get("url")))
+        if item.get("site"):
+            extra.append(str(item.get("site")))
+        summary = f"{title}  相似度:{sim_pct:.1f}%" + (f"  ({' '.join(extra)})" if extra else "")
+        return sim_pct, summary

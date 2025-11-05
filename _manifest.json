@@ -15,7 +15,7 @@
   "homepage_url": "https://github.com/MaiM-with-u/maibot",
   "repository_url": "https://github.com/MaiM-with-u/maibot",
   "keywords": ["anime", "trace", "image", "recognition", "搜番"],
-  "categories": ["Image", "Recognition", "Utility"],
+  "categories": ["Multimedia", "External Integration"],
 
   "default_locale": "zh-CN",
   "locales_path": "_locales",
@@ -25,11 +25,10 @@
     "plugin_type": "service",
     "components": [
       {
-        "type": "event_handler",
-        "name": "animetrace_on_message",
-        "description": "接收图片并识别"
+        "type": "tool",
+        "name": "anime_trace_search",
+        "description": "AnimeTrace image search tool"
       }
     ]
   }
 }
-

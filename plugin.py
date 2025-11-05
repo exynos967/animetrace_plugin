@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+from maim_message import Seg
+from src.common.database.database_model import Images
 from src.plugin_system import (
     BasePlugin,
     BaseTool,
@@ -19,9 +21,7 @@ from src.plugin_system import (
     register_plugin,
 )
 
-from maim_message import Seg
 from .trace_client import AnimeTraceClient, AnimeTraceError
-from src.common.database.database_model import Images
 
 
 class AnimeTraceTool(BaseTool):
@@ -30,7 +30,7 @@ class AnimeTraceTool(BaseTool):
     name: str = "anime_trace_search"
     description: str = "Recognise anime images via AnimeTrace and return likely works or characters."
     parameters: List[Tuple[str, ToolParamType, str, bool, List[str] | None]] = [
-        ("use_reply", ToolParamType.STRING, "Whether to use the referenced message image (true/false)", False, None),
+        ("use_reply", ToolParamType.BOOLEAN, "Whether to use the referenced message image", False, None),
         ("image_index", ToolParamType.INTEGER, "Index of the image inside the selected message (default 1)", False, None),
         ("is_multi", ToolParamType.INTEGER, "Request multiple candidates from AnimeTrace (0 or 1)", False, None),
         ("model", ToolParamType.STRING, "AnimeTrace model name", False, None),
@@ -145,45 +145,53 @@ class AnimeTraceTool(BaseTool):
         ]
 
     def _collect_images_from_any(self, obj: Any, out: List[str]) -> None:
+        """Dispatch image extraction by type to reduce branching complexity."""
         if obj is None:
             return
-
         if isinstance(obj, Seg):
-            seg_type = getattr(obj, "type", "")
-            data = getattr(obj, "data", None)
-            if seg_type in {"image", "emoji"}:
-                self._append_candidate(data, out)
-                return
-            if seg_type == "seglist" and isinstance(data, list):
-                for sub in data:
-                    self._collect_images_from_any(sub, out)
-                return
-            if isinstance(data, (list, dict, str)):
-                self._collect_images_from_any(data, out)
+            self._handle_seg(obj, out)
             return
-
         if isinstance(obj, list):
-            for item in obj:
-                self._collect_images_from_any(item, out)
+            self._handle_list(obj, out)
             return
-
         if isinstance(obj, dict):
-            if "type" in obj and "data" in obj:
-                try:
-                    seg = Seg.from_dict(obj)
-                    self._collect_images_from_any(seg, out)
-                except Exception:
-                    pass
-            for key in ("base64", "url", "file"):
-                value = obj.get(key)
-                self._append_candidate(value, out)
-            for key in ("message_segment", "message", "data", "content", "segments"):
-                if key in obj:
-                    self._collect_images_from_any(obj[key], out)
+            self._handle_dict(obj, out)
             return
-
         if isinstance(obj, str):
-            self._append_candidate(obj, out)
+            self._handle_str(obj, out)
+
+    def _handle_seg(self, seg: Seg, out: List[str]) -> None:
+        seg_type = getattr(seg, "type", "")
+        data = getattr(seg, "data", None)
+        if seg_type in {"image", "emoji"}:
+            self._append_candidate(data, out)
+            return
+        if seg_type == "seglist" and isinstance(data, list):
+            for sub in data:
+                self._collect_images_from_any(sub, out)
+            return
+        if isinstance(data, (list, dict, str)):
+            self._collect_images_from_any(data, out)
+
+    def _handle_list(self, items: List[Any], out: List[str]) -> None:
+        for item in items:
+            self._collect_images_from_any(item, out)
+
+    def _handle_dict(self, obj: Dict[str, Any], out: List[str]) -> None:
+        if "type" in obj and "data" in obj:
+            try:
+                seg = Seg.from_dict(obj)
+                self._collect_images_from_any(seg, out)
+            except Exception:
+                pass
+        for key in ("base64", "url", "file"):
+            self._append_candidate(obj.get(key), out)
+        for key in ("message_segment", "message", "data", "content", "segments"):
+            if key in obj:
+                self._collect_images_from_any(obj[key], out)
+
+    def _handle_str(self, s: str, out: List[str]) -> None:
+        self._append_candidate(s, out)
 
     def _unique_candidates(self, items: List[str]) -> List[str]:
         seen: set[str] = set()
@@ -225,6 +233,9 @@ class AnimeTraceTool(BaseTool):
     ) -> str:
         if not candidates:
             raise AnimeTraceError("未找到可用的图片")
+        # 允许负索引（-1 为最后一张）
+        if image_index < 0:
+            image_index = len(candidates) + 1 + image_index
         if image_index <= 0 or image_index > len(candidates):
             raise AnimeTraceError(f"仅找到 {len(candidates)} 张图片，请调整 image_index 参数 (1-{len(candidates)})")
         selected = candidates[image_index - 1]
@@ -295,73 +306,56 @@ class AnimeTraceTool(BaseTool):
         return candidates
 
     def _extract_images_from_db_message(self, db_msg) -> List[str]:
+        images = self._extract_from_additional_config(db_msg)
+        if not images:
+            images = self._extract_from_plain_texts(db_msg)
+        return self._unique_candidates(images)
+
+    def _extract_from_additional_config(self, db_msg) -> List[str]:
         images: List[str] = []
         config_str = getattr(db_msg, "additional_config", None)
-        if config_str:
-            try:
-                payload = json.loads(config_str)
-                if isinstance(payload, dict):
-                    seg_dict = payload.get("message_segment")
-                    if isinstance(seg_dict, dict):
-                        seg = Seg.from_dict(seg_dict)
-                        self._collect_images_from_any(seg, images)
-            except Exception:
-                pass
+        if not config_str:
+            return images
+        try:
+            payload = json.loads(config_str)
+            if isinstance(payload, dict):
+                seg_dict = payload.get("message_segment")
+                if isinstance(seg_dict, dict):
+                    seg = Seg.from_dict(seg_dict)
+                    self._collect_images_from_any(seg, images)
+        except Exception:
+            return images
+        return images
 
-        if not images:
-            for field in ("display_message", "processed_plain_text"):
-                text = getattr(db_msg, field, None)
-                if not text:
-                    continue
-                for match in re.findall(r"\[CQ:image[^\]]+\]", text):
-                    images.append(match)
-                for match in re.findall(r"(https?://\S+)", text):
-                    images.append(match)
-                for match in re.findall(r"\[picid:[^\]]+\]", text):
-                    images.append(match)
-        return self._unique_candidates(images)
+    def _extract_from_plain_texts(self, db_msg) -> List[str]:
+        images: List[str] = []
+        for field in ("display_message", "processed_plain_text"):
+            text = getattr(db_msg, field, None)
+            if not text:
+                continue
+            images.extend(re.findall(r"\[CQ:image[^\]]+\]", text))
+            images.extend(re.findall(r"(https?://\S+)", text))
+            images.extend(re.findall(r"\[picid:[^\]]+\]", text))
+        return images
 
     async def _choose_candidate_with_llm(
         self, candidates: List[Dict[str, Any]]
     ) -> Tuple[Dict[str, Any], int]:
         if not candidates:
             raise AnimeTraceError("未找到候选图片")
-
         if not self.get_config("anime_trace.use_image_selector_llm", True):
             return candidates[-1], 1
 
-        try:
-            models = llm_api.get_available_models()
-        except Exception as err:
-            self.logger.warning(f"获取模型列表失败，使用默认候选: {err}")
-            return candidates[-1], 1
-
-        if not models:
-            return candidates[-1], 1
-
-        configured_key = str(
-            self.get_config("anime_trace.image_selector_model_key", "")
-            or self.get_config("anime_trace.llm_model_key", "")
-        ).strip()
-        prefer_keys = [configured_key, "plugin_reply", "replyer", "reply", "chat"]
-        task = None
-        chosen_key = None
-        for key in prefer_keys:
-            if key and key in models:
-                task = models[key]
-                chosen_key = key
-                break
+        task, chosen_key = self._select_llm_task()
         if task is None:
             return candidates[-1], 1
 
         latest_message = self._get_latest_message()
-        request_text = ""
-        if latest_message:
-            request_text = (
-                getattr(latest_message, "processed_plain_text", "")
-                or getattr(latest_message, "display_message", "")
-                or ""
-            )
+        request_text = (
+            (getattr(latest_message, "processed_plain_text", "") or getattr(latest_message, "display_message", ""))
+            if latest_message
+            else ""
+        )
 
         prompt = self._build_selector_prompt(request_text, candidates)
         try:
@@ -379,6 +373,27 @@ class AnimeTraceTool(BaseTool):
         except Exception as err:
             self.logger.error(f"图片选择模型调用失败: {err}")
         return candidates[-1], 1
+
+    def _select_llm_task(self):
+        try:
+            models = llm_api.get_available_models()
+        except Exception as err:
+            self.logger.warning(f"获取模型列表失败，使用默认候选: {err}")
+            return None, None
+        if not models:
+            return None, None
+        configured_key = str(
+            self.get_config("anime_trace.image_selector_model_key", "")
+            or self.get_config("anime_trace.llm_model_key", "")
+        ).strip()
+        prefer_keys = [configured_key, "plugin_reply", "replyer", "reply", "chat"]
+        for key in prefer_keys:
+            if key and key in models:
+                return models[key], key
+        try:
+            return next(iter(models.values())), None
+        except StopIteration:
+            return None, None
 
     def _build_selector_prompt(self, request_text: str, candidates: List[Dict[str, Any]]) -> str:
         lines = []
@@ -455,40 +470,57 @@ class AnimeTraceTool(BaseTool):
         if not source:
             raise AnimeTraceError("Image data is empty; please provide a valid image.")
 
-        if source.startswith("base64://"):
-            return self._normalize_base64(source[len("base64://") :])
-        if source.startswith("data:"):
-            return self._normalize_base64(source.split(",", 1)[-1])
+        # direct base64/data url
+        direct = await self._resolve_url_or_base64(source)
+        if direct is not None:
+            return direct
 
+        # CQ:image
         if source.startswith("[CQ:image"):
-            base64_match = re.search(r"base64=([^,\\]]+)", source)
-            if base64_match:
-                return self._normalize_base64(base64_match.group(1))
-            url_match = re.search(r"url=([^,\\]]+)", source)
-            if url_match:
-                remote_base64 = await self.client.url_to_base64(url_match.group(1))
-                return self._normalize_base64(remote_base64)
-            file_match = re.search(r"file=([^,\\]]+)", source)
-            if file_match:
-                file_value = file_match.group(1)
-                if file_value.startswith("base64://"):
-                    return self._normalize_base64(file_value[len("base64://") :])
-                if file_value.startswith("http://") or file_value.startswith("https://"):
-                    remote_base64 = await self.client.url_to_base64(file_value)
-                    return self._normalize_base64(remote_base64)
+            cq_resolved = await self._resolve_cq_image(source)
+            if cq_resolved is not None:
+                return cq_resolved
 
-        picid_match = re.search(r"\[picid:([^\]]+)\]", source)
-        if picid_match:
-            return await self._picid_to_base64(picid_match.group(1))
+        # picid
+        m = re.search(r"\[picid:([^\]]+)\]", source)
+        if m:
+            return await self._picid_to_base64(m.group(1))
 
+        # plain url
         if source.startswith("http://") or source.startswith("https://"):
             remote_base64 = await self.client.url_to_base64(source)
             return self._normalize_base64(remote_base64)
 
+        # raw base64
         if self._looks_like_base64(source):
             return self._normalize_base64(source)
 
         raise AnimeTraceError("Unable to resolve image data; please make sure the image is accessible.")
+
+    async def _resolve_cq_image(self, source: str) -> Optional[str]:
+        base64_match = re.search(r"base64=([^,\\]]+)", source)
+        if base64_match:
+            return self._normalize_base64(base64_match.group(1))
+        url_match = re.search(r"url=([^,\\]]+)", source)
+        if url_match:
+            remote_base64 = await self.client.url_to_base64(url_match.group(1))
+            return self._normalize_base64(remote_base64)
+        file_match = re.search(r"file=([^,\\]]+)", source)
+        if file_match:
+            file_value = file_match.group(1)
+            if file_value.startswith("base64://"):
+                return self._normalize_base64(file_value[len("base64://") :])
+            if file_value.startswith("http://") or file_value.startswith("https://"):
+                remote_base64 = await self.client.url_to_base64(file_value)
+                return self._normalize_base64(remote_base64)
+        return None
+
+    async def _resolve_url_or_base64(self, source: str) -> Optional[str]:
+        if source.startswith("base64://"):
+            return self._normalize_base64(source[len("base64://") :])
+        if source.startswith("data:"):
+            return self._normalize_base64(source.split(",", 1)[-1])
+        return None
 
     async def _picid_to_base64(self, image_id: str) -> str:
         try:
@@ -509,7 +541,8 @@ class AnimeTraceTool(BaseTool):
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, str]:
         use_reply = self._safe_bool(function_args.get("use_reply", False), False)
         image_index = self._safe_int(function_args.get("image_index", 1), 1)
-        if image_index <= 0:
+        # 允许负索引：-1 表示最后一张
+        if image_index == 0:
             image_index = 1
 
         is_multi_default = self.get_config("anime_trace.is_multi", 1)
@@ -563,7 +596,6 @@ class AnimeTraceTool(BaseTool):
     def _build_candidate_lines(self, resp: Dict[str, Any], threshold: float) -> List[str]:
         data = resp.get("data")
         candidates: List[Dict[str, Any]] = []
-
         if isinstance(data, list):
             candidates = [item for item in data if isinstance(item, dict)]
         elif isinstance(data, dict):
@@ -581,23 +613,34 @@ class AnimeTraceTool(BaseTool):
         return lines
 
     def _format_candidate(self, item: Dict[str, Any], idx: int, threshold: float) -> Optional[str]:
-        characters = item.get("character")
-        if isinstance(characters, list) and characters:
-            top = []
-            for ch in characters[:3]:
-                if not isinstance(ch, dict):
-                    continue
-                work = (ch.get("work") or "").strip()
-                name = (ch.get("character") or "").strip()
-                if work and name:
-                    top.append(f"{work}:{name}")
-                elif name:
-                    top.append(name)
-                elif work:
-                    top.append(work)
-            if top:
-                return f"{idx}. 角色候选：{'；'.join(top)}"
+        # 角色类候选
+        line = self._format_character_candidate(item, idx)
+        if line:
+            return line
+        # 作品类候选
+        return self._format_title_candidate(item, idx, threshold)
 
+    def _format_character_candidate(self, item: Dict[str, Any], idx: int) -> Optional[str]:
+        characters = item.get("character")
+        if not (isinstance(characters, list) and characters):
+            return None
+        top: List[str] = []
+        for ch in characters[:3]:
+            if not isinstance(ch, dict):
+                continue
+            work = (ch.get("work") or "").strip()
+            name = (ch.get("character") or "").strip()
+            if work and name:
+                top.append(f"{work}:{name}")
+            elif name:
+                top.append(name)
+            elif work:
+                top.append(work)
+        if not top:
+            return None
+        return f"{idx}. 角色候选：{'；'.join(top)}"
+
+    def _format_title_candidate(self, item: Dict[str, Any], idx: int, threshold: float) -> Optional[str]:
         title = (
             item.get("title")
             or item.get("name")
@@ -608,7 +651,6 @@ class AnimeTraceTool(BaseTool):
         ).strip()
         if not title:
             return None
-
         similarity_raw = (
             item.get("similarity")
             or item.get("score")
@@ -618,7 +660,6 @@ class AnimeTraceTool(BaseTool):
         similarity = AnimeTraceClient._norm_similarity(AnimeTraceClient._as_float(similarity_raw))
         if threshold and similarity is not None and similarity < threshold:
             return None
-
         extras: List[str] = []
         for key in ("episode", "part", "chapter", "time"):
             value = item.get(key)
@@ -628,7 +669,6 @@ class AnimeTraceTool(BaseTool):
             extras.append(str(item.get("site")))
         if item.get("url"):
             extras.append(str(item.get("url")))
-
         line = f"{idx}. {title}"
         if similarity is not None:
             line += f"（相似度 {similarity:.1f}%）"
@@ -706,74 +746,74 @@ class AnimeTracePlugin(BasePlugin):
         "config_version": ConfigField(
             type=str,
             default="2.2.0",
-            description="Config file version",
+            description="配置文件版本",
         ),
         "enabled": ConfigField(
             type=bool,
             default=True,
-            description="Enable plugin",
+            description="是否启用插件",
         ),
     },
     "anime_trace": {
         "endpoint": ConfigField(
             type=str,
             default="https://api.animetrace.com/v1/search",
-            description="AnimeTrace API endpoint",
+            description="AnimeTrace 接口地址",
         ),
         "model": ConfigField(
             type=str,
             default="animetrace_high_beta",
-            description="Default AnimeTrace model",
+            description="默认识别模型",
         ),
         "is_multi": ConfigField(
             type=int,
             default=1,
-            description="Return multiple candidates (0/1)",
+            description="是否返回多条候选（0/1）",
         ),
         "ai_detect": ConfigField(
             type=int,
             default=1,
-            description="Enable AnimeTrace AI detection (1/2)",
+            description="是否开启AI图检测（1=开启，2=关闭）",
         ),
         "request_timeout": ConfigField(
             type=float,
             default=15.0,
-            description="HTTP request timeout in seconds",
+            description="HTTP 请求超时（秒）",
         ),
         "min_similarity": ConfigField(
             type=float,
             default=0.0,
-            description="Minimum similarity threshold",
+            description="最小相似度阈值（百分比 0–100）",
         ),
         "history_lookup_seconds": ConfigField(
             type=float,
             default=3600.0,
-            description="Lookback window for history search (seconds)",
+            description="历史消息回溯窗口（秒）",
         ),
         "history_lookup_limit": ConfigField(
             type=int,
             default=20,
-            description="Maximum number of history messages to scan",
+            description="最多扫描的历史消息条数",
         ),
         "use_image_selector_llm": ConfigField(
             type=bool,
             default=True,
-            description="Use LLM to choose history images",
+            description="是否使用 LLM 选择历史消息中的图片",
         ),
         "image_selector_model_key": ConfigField(
             type=str,
             default="plugin_reply",
-            description="Model key for history image selection",
+            description="用于图片选择的模型键名",
         ),
         "use_llm": ConfigField(
             type=bool,
             default=False,
-            description="Summarize AnimeTrace result with LLM",
+            description="是否使用 LLM 总结识别结果(暂时无效)",
         ),
         "llm_model_key": ConfigField(
             type=str,
             default="plugin_reply",
-            description="Model key for final response summary",
+            description="用于最终结果摘要的模型键名(暂时无效)",
         ),
     },
 }
