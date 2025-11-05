@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -10,8 +9,6 @@ try:
 except Exception:  # pragma: no cover - 作为可选依赖
     httpx = None  # type: ignore
 
-from urllib import request as urllib_request
-from urllib.error import URLError, HTTPError
 from src.common.logger import get_logger
 
 
@@ -46,11 +43,11 @@ class AnimeTraceClient:
         is_multi: int = 1,
         ai_detect: int = 1,
     ) -> Dict[str, Any]:
-        # 规范化为服务更常见的表单参数风格（is_multi/ai_detect 使用 '1'/'0' 字符串）
+        # 请求体（JSON 优先），数值字段保持原始类型
         payload: Dict[str, Any] = {
             "model": model,
-            "is_multi": str(is_multi),
-            "ai_detect": str(ai_detect),
+            "is_multi": is_multi,
+            "ai_detect": ai_detect,
         }
         files = None
 
@@ -72,133 +69,52 @@ class AnimeTraceClient:
         except Exception:
             pass
 
-        if httpx is not None:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                try:
-                    if files:
-                        resp = await client.post(
-                            self.endpoint, data=payload, files=files
-                        )
-                    else:
-                        # 优先 JSON
-                        resp = await client.post(self.endpoint, json=payload)
-                except httpx.HTTPError as e:  # type: ignore
-                    raise AnimeTraceError(f"网络异常: {e}")
+        if httpx is None:
+            raise AnimeTraceError(
+                "缺少 httpx 依赖，请安装 httpx 以使用 AnimeTrace 请求"
+            )
 
-                # info 日志：状态码与内容长度
-                try:
-                    self.logger.info(
-                        f"[AnimeTrace] POST {self.endpoint} status={resp.status_code} content-length={resp.headers.get('content-length', '-')}"
-                    )
-                except Exception:
-                    pass
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                if files:
+                    resp = await client.post(self.endpoint, data=payload, files=files)
+                else:
+                    resp = await client.post(self.endpoint, json=payload)
+            except httpx.HTTPError as e:  # type: ignore
+                raise AnimeTraceError(f"网络异常: {e}")
 
-                if resp.status_code >= 400:
-                    err_excerpt = ""
+            # info 日志：状态码与内容长度
+            try:
+                self.logger.info(
+                    f"[AnimeTrace] POST {self.endpoint} status={resp.status_code} content-length={resp.headers.get('content-length', '-')}"
+                )
+            except Exception:
+                pass
+
+            if resp.status_code >= 400:
+                err_excerpt = ""
+                try:
+                    txt = resp.text[:200]
                     try:
-                        txt = resp.text[:200]
-                        try:
-                            j = resp.json()
-                            msg = j.get("message") or j.get("msg") or ""
-                            code = j.get("code")
-                            if msg:
-                                err_excerpt = f" code={code} msg={msg}"
-                            else:
-                                err_excerpt = f" body={txt}"
-                        except Exception:
+                        j = resp.json()
+                        msg = j.get("message") or j.get("msg") or ""
+                        code = j.get("code")
+                        if msg:
+                            err_excerpt = f" code={code} msg={msg}"
+                        else:
                             err_excerpt = f" body={txt}"
                     except Exception:
-                        pass
-
-                    # 回退为 FORM 一次（仅当非文件）
-                    if files is None:
-                        try:
-                            self.logger.info(
-                                "[AnimeTrace] 4xx received, retry with FORM body"
-                            )
-                            # FORM 回退前记录请求体
-                            try:
-                                payload_log2 = self._build_log_payload(
-                                    payload, None, None
-                                )
-                                self.logger.info(
-                                    f"[AnimeTrace] Request body(FORM retry): {payload_log2}"
-                                )
-                            except Exception:
-                                pass
-                            resp2 = await client.post(self.endpoint, data=payload)
-                            self.logger.info(
-                                f"[AnimeTrace] RETRY FORM status={resp2.status_code}"
-                            )
-                            if resp2.status_code < 400:
-                                return resp2.json()  # type: ignore
-                            else:
-                                try:
-                                    txt2 = resp2.text[:200]
-                                    try:
-                                        j2 = resp2.json()
-                                        msg2 = j2.get("message") or j2.get("msg") or ""
-                                        code2 = j2.get("code")
-                                        if msg2:
-                                            err_excerpt = f" code={code2} msg={msg2}"
-                                        else:
-                                            err_excerpt = f" body={txt2}"
-                                    except Exception:
-                                        err_excerpt = f" body={txt2}"
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                    raise AnimeTraceError(
-                        f"HTTP 错误{err_excerpt}", status=resp.status_code
-                    )
-                try:
-                    return resp.json()  # type: ignore
+                        err_excerpt = f" body={txt}"
                 except Exception:
-                    raise AnimeTraceError("响应解析失败")
+                    pass
+                raise AnimeTraceError(
+                    f"HTTP 错误{err_excerpt}", status=resp.status_code
+                )
 
-        # 兼容：无 httpx 时使用内置 urllib 执行 JSON 请求（仅支持 url/base64）
-        if files is not None:
-            raise AnimeTraceError("在缺少 httpx 时不支持文件上传，请改用 url/base64")
-
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib_request.Request(
-            self.endpoint, data=data, headers={"Content-Type": "application/json"}
-        )
-
-        # urllib 路径记录请求体
-        try:
-            payload_log3 = self._build_log_payload(payload, None, None)
-            self.logger.info(f"[AnimeTrace] Request body(JSON urllib): {payload_log3}")
-        except Exception:
-            pass
-
-        def _do() -> Dict[str, Any]:
             try:
-                with urllib_request.urlopen(req, timeout=self.timeout) as r:  # nosec - 外部 URL 由配置控制
-                    status = getattr(r, "status", None) or r.getcode()
-                    clen = (
-                        r.headers.get("Content-Length", "-")
-                        if hasattr(r, "headers")
-                        else "-"
-                    )
-                    try:
-                        self.logger.info(
-                            f"[AnimeTrace] POST {self.endpoint} status={status} content-length={clen}"
-                        )
-                    except Exception:
-                        pass
-                    content = r.read().decode("utf-8")
-                return json.loads(content)
-            except HTTPError as e:
-                raise AnimeTraceError("HTTP 错误", status=e.code)
-            except URLError as e:  # pragma: no cover
-                raise AnimeTraceError(f"网络异常: {e.reason}")
+                return resp.json()  # type: ignore
             except Exception:
                 raise AnimeTraceError("响应解析失败")
-
-        return await asyncio.to_thread(_do)
 
     def _build_log_payload(
         self, payload: Dict[str, Any], files, file_bytes: Optional[bytes]
@@ -213,43 +129,22 @@ class AnimeTraceClient:
             red["file"] = f"<file bytes={length}>"
         return red
 
-    # --------- 下载工具，供“统一优先级”策略使用 ---------
+    # --------- 下载工具（要求 httpx） ---------
     async def download_bytes(self, url: str) -> bytes:
-        """下载图片字节，用于 URL → base64 或文件上传路径。
-
-        采用 httpx 优先，缺失时回退 urllib。
-        """
-        if httpx is not None:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                try:
-                    resp = await client.get(url)
-                    self.logger.info(
-                        f"[AnimeTrace] GET {url} status={resp.status_code} len={len(resp.content)}"
-                    )
-                    if resp.status_code >= 400:
-                        raise AnimeTraceError("下载失败", status=resp.status_code)
-                    return resp.content
-                except httpx.HTTPError as e:  # type: ignore
-                    raise AnimeTraceError(f"下载异常: {e}")
-
-        def _do() -> bytes:
+        """下载图片字节，用于 URL → base64 或文件上传路径。"""
+        if httpx is None:
+            raise AnimeTraceError("缺少 httpx 依赖，无法下载图片")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             try:
-                with urllib_request.urlopen(url, timeout=self.timeout) as r:  # nosec - 外部 URL 由配置控制
-                    status = getattr(r, "status", None) or r.getcode()
-                    content = r.read()
-                    try:
-                        self.logger.info(
-                            f"[AnimeTrace] GET {url} status={status} len={len(content)}"
-                        )
-                    except Exception:
-                        pass
-                    return content
-            except HTTPError as e:
-                raise AnimeTraceError("下载失败", status=e.code)
-            except URLError as e:  # pragma: no cover
-                raise AnimeTraceError(f"下载异常: {e.reason}")
-
-        return await asyncio.to_thread(_do)
+                resp = await client.get(url)
+                self.logger.info(
+                    f"[AnimeTrace] GET {url} status={resp.status_code} len={len(resp.content)}"
+                )
+                if resp.status_code >= 400:
+                    raise AnimeTraceError("下载失败", status=resp.status_code)
+                return resp.content
+            except httpx.HTTPError as e:  # type: ignore
+                raise AnimeTraceError(f"下载异常: {e}")
 
     async def url_to_base64(self, url: str) -> str:
         data = await self.download_bytes(url)
