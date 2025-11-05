@@ -1,19 +1,19 @@
 {
   "manifest_version": 1,
-  "name": "AnimeTrace 图片识别插件 (AnimeTrace Image Recognizer)",
-  "version": "1.0.0",
+  "name": "AnimeTrace 图片识别插件",
+  "version": "2.2.0",
   "description": "接收图片并调用 AnimeTrace 识别，返回文本结果到 QQ",
   "author": {
-    "name": "MaiBot 插件开发",
-    "url": "https://github.com/MaiM-with-u"
+    "name": "薄暝&晴空",
+    "url": "https://github.com/exynos967/animetrace_plugin"
   },
-  "license": "GPL-v3.0-or-later",
+  "license": "MIT",
 
   "host_application": {
     "min_version": "0.8.0"
   },
-  "homepage_url": "https://github.com/MaiM-with-u/maibot",
-  "repository_url": "https://github.com/MaiM-with-u/maibot",
+  "homepage_url": "https://github.com/exynos967/animetrace_plugin",
+  "repository_url": "https://github.com/exynos967/animetrace_plugin",
   "keywords": ["anime", "trace", "image", "recognition", "搜番"],
   "categories": ["Multimedia", "External Integration"],
 
