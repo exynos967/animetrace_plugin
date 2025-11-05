@@ -2,8 +2,6 @@
 
 使用 AnimeTrace 服务对 QQ 图片进行识别的 MaiBot 插件。本插件以「Tool」组件形式提供 anime_trace_search 工具，支持从回复/当前/历史消息中自动选取图片，调用 AnimeTrace 并返回可读的结果摘要与候选列表。
 
-提示：本插件以实际代码为准（manifest 与 README 已同步到当前实现）。
-
 ## 功能特性
 - Tool 组件：`anime_trace_search`，由 LLM 按需调用，也可在插件内直接调用
 - 图片来源自动解析：支持 Seg（image/emoji/seglist）、CQ 码 `[CQ:image ...]`、`[picid:...]`、URL、Base64
@@ -26,11 +24,11 @@
 注意：不要手动创建 `config.toml`，请以 `plugin.py` 中的 `config_schema` 为准（系统自动生成）
 
 ## 依赖
-- Python 可选依赖：`httpx>=0.24.0`
+- Python 依赖：`httpx>=0.24.0`
   - 安装：`pip install httpx`
   - 未安装时调用会提示缺失
 
-## 配置项（自动生成，中文注释）
+## 配置项
 `config.toml` 的注释说明来源于 `config_schema`，以下为关键项与默认值：
 
 ```
