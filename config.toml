@@ -1,0 +1,18 @@
+[plugin]
+config_version = "1.0.0"
+enabled = true
+
+[anime_trace]
+# AnimeTrace API 基本配置
+endpoint = "https://api.animetrace.com/v1/search"
+model = "animetrace_high_beta"
+is_multi = 1
+ai_detect = 1
+request_timeout = 15.0
+
+# 触发策略
+auto_on_image = true              # 收到图片自动识别
+trigger_keywords = ["/trace", "动漫识别", "以图搜番"]
+max_images = 1
+min_similarity = 0.0
+
