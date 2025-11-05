@@ -13,6 +13,7 @@ from src.plugin_system import (
     PythonDependency,
     get_logger,
     register_plugin,
+    llm_api,
 )
 
 from .trace_client import AnimeTraceClient, AnimeTraceError
@@ -265,7 +266,60 @@ class AnimeTraceOnMessage(BaseEventHandler):
             lines = ["未获得识别结果"]
 
         reply_text = "\n".join(lines)
-        await self.send_text(stream_id, reply_text)
+
+        # === LLM 处理：将识别结果传递给 LLM，再将 LLM 生成内容回复 ===
+        use_llm: bool = bool(self.get_config("anime_trace.use_llm", True))
+        if use_llm:
+            try:
+                models = llm_api.get_available_models()
+                # 强制优先使用 MaiBot 的 replyer 模型（plugin_reply / replyer / reply），可由配置覆盖键名
+                configured_key = str(
+                    self.get_config("anime_trace.llm_model_key", "plugin_reply")
+                ).strip()
+                prefer_keys = [
+                    k
+                    for k in [
+                        configured_key,
+                        "plugin_reply",
+                        "replyer",
+                        "reply",
+                        "chat",
+                    ]
+                    if k
+                ]
+                task = None
+                for key in prefer_keys:
+                    if key in models:
+                        task = models[key]
+                        break
+                if not task and models:
+                    self._logger.warning(
+                        "未找到指定的 replyer 模型键，使用第一个可用模型兜底"
+                    )
+                    task = next(iter(models.values()))
+
+                prompt_header = (
+                    "你是动漫识别助手。以下是识别结果摘要，请用简洁中文生成可读回复，"
+                    "若包含角色TopN则简要解释；若包含相似度则给出最可能项，两三行内完成：\n\n"
+                )
+                prompt = prompt_header + reply_text
+
+                if task:
+                    success, gen, _, model_name = await llm_api.generate_with_model(
+                        prompt, task, request_type="plugin.animetrace.summarize"
+                    )
+                    self._logger.info(
+                        f"LLM generate success={success} model={model_name} len={len(gen) if isinstance(gen, str) else 0}"
+                    )
+                    await self.send_text(stream_id, gen if success else reply_text)
+                else:
+                    self._logger.warning("未找到可用LLM模型，直接返回识别摘要")
+                    await self.send_text(stream_id, reply_text)
+            except Exception as e:
+                self._logger.error(f"LLM 处理异常: {e}")
+                await self.send_text(stream_id, reply_text)
+        else:
+            await self.send_text(stream_id, reply_text)
         return True, True, None, None, None
 
 
@@ -333,6 +387,14 @@ class AnimeTracePlugin(BasePlugin):
                 type=str,
                 default="prefer_base64",
                 description="输入优先级: auto/prefer_url/prefer_base64",
+            ),
+            "use_llm": ConfigField(
+                type=bool, default=True, description="是否将结果交由LLM生成回复"
+            ),
+            "llm_model_key": ConfigField(
+                type=str,
+                default="plugin_reply",
+                description="指定 LLM 模型键（默认 replyer）",
             ),
         },
     }
