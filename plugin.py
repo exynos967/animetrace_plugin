@@ -28,20 +28,55 @@ class AnimeTraceTool(BaseTool):
     """Tool wrapper that sends images to AnimeTrace for recognition."""
 
     name: str = "anime_trace_search"
-    description: str = "Recognise anime images via AnimeTrace and return likely works or characters."
+    description: str = (
+        "Recognise anime images via AnimeTrace and return likely works or characters."
+    )
+    # 使用枚举满足框架检查；针对 use_reply 规避核心把 boolean 映射为 'bool' 的问题，改为 STRING（由工具内部做布尔解析）。
     parameters: List[Tuple[str, ToolParamType, str, bool, List[str] | None]] = [
-        ("use_reply", ToolParamType.BOOLEAN, "Whether to use the referenced message image", False, None),
-        ("image_index", ToolParamType.INTEGER, "Index of the image inside the selected message (default 1)", False, None),
-        ("is_multi", ToolParamType.INTEGER, "Request multiple candidates from AnimeTrace (0 or 1)", False, None),
+        (
+            "use_reply",
+            ToolParamType.STRING,  # 规避 JSON Schema 'bool' 错误，接受 'true'/'false' 字符串
+            "Whether to use the referenced message image (true/false)",
+            False,
+            None,
+        ),
+        (
+            "image_index",
+            ToolParamType.INTEGER,
+            "Index of the image inside the selected message (default 1)",
+            False,
+            None,
+        ),
+        (
+            "is_multi",
+            ToolParamType.INTEGER,
+            "Request multiple candidates from AnimeTrace (0 or 1)",
+            False,
+            None,
+        ),
         ("model", ToolParamType.STRING, "AnimeTrace model name", False, None),
-        ("ai_detect", ToolParamType.INTEGER, "Enable AnimeTrace AI detection (1=on, 2=off)", False, None),
-        ("min_similarity", ToolParamType.STRING, "Minimum similarity threshold (supports decimal or percent)", False, None),
+        (
+            "ai_detect",
+            ToolParamType.INTEGER,
+            "Enable AnimeTrace AI detection (1=on, 2=off)",
+            False,
+            None,
+        ),
+        (
+            "min_similarity",
+            ToolParamType.STRING,
+            "Minimum similarity threshold (supports decimal or percent)",
+            False,
+            None,
+        ),
     ]
     available_for_llm: bool = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        endpoint = self.get_config("anime_trace.endpoint", "https://api.animetrace.com/v1/search")
+        endpoint = self.get_config(
+            "anime_trace.endpoint", "https://api.animetrace.com/v1/search"
+        )
         timeout = float(self.get_config("anime_trace.request_timeout", 15.0) or 15.0)
         self.client = AnimeTraceClient(endpoint=endpoint, timeout=timeout)
         self.logger = get_logger("animetrace_tool")
@@ -94,28 +129,40 @@ class AnimeTraceTool(BaseTool):
             cleaned = cleaned.split(",", 1)[-1]
         return cleaned.replace("\n", "").replace("\r", "")
 
-    async def _get_base64_from_context(self, *, image_index: int, use_reply: bool) -> str:
+    async def _get_base64_from_context(
+        self, *, image_index: int, use_reply: bool
+    ) -> str:
         message = self._get_latest_message()
         exclude_ids: set[str] = set()
 
         # 1 优先使用引用消息
         if use_reply and message and getattr(message, "reply", None):
-            reply_candidates = self._extract_images_from_message(message.reply, origin="reply")
+            reply_candidates = self._extract_images_from_message(
+                message.reply, origin="reply"
+            )
             if reply_candidates:
                 return await self._pick_image_from_candidates(
-                    reply_candidates, image_index, getattr(message.reply.message_info, "message_id", None)
+                    reply_candidates,
+                    image_index,
+                    getattr(message.reply.message_info, "message_id", None),
                 )
 
         # 2) 使用当前消息
         if message:
-            current_candidates = self._extract_images_from_message(message, origin="current")
+            current_candidates = self._extract_images_from_message(
+                message, origin="current"
+            )
             if current_candidates:
                 return await self._pick_image_from_candidates(
-                    current_candidates, image_index, getattr(message.message_info, "message_id", None)
+                    current_candidates,
+                    image_index,
+                    getattr(message.message_info, "message_id", None),
                 )
 
         # 3) 历史消息兜底
-        return await self._select_image_from_history(image_index=image_index, exclude_message_ids=exclude_ids)
+        return await self._select_image_from_history(
+            image_index=image_index, exclude_message_ids=exclude_ids
+        )
 
     def _get_latest_message(self):
         if not self.chat_stream or not getattr(self.chat_stream, "context", None):
@@ -125,7 +172,9 @@ class AnimeTraceTool(BaseTool):
         except Exception:
             return None
 
-    def _extract_images_from_message(self, message, origin: str = "current") -> List[Dict[str, Any]]:
+    def _extract_images_from_message(
+        self, message, origin: str = "current"
+    ) -> List[Dict[str, Any]]:
         items: List[str] = []
         if message is None:
             return []
@@ -140,7 +189,12 @@ class AnimeTraceTool(BaseTool):
             message_id = getattr(message.message_info, "message_id", None)
         summary = self._build_message_summary(message)
         return [
-            {"data": item, "message_id": message_id, "origin": origin, "summary": summary}
+            {
+                "data": item,
+                "message_id": message_id,
+                "origin": origin,
+                "summary": summary,
+            }
             for item in unique_items
         ]
 
@@ -209,7 +263,11 @@ class AnimeTraceTool(BaseTool):
         user_name = ""
         if info and getattr(info, "user_info", None):
             user_name = info.user_info.user_nickname or info.user_info.user_id or ""
-        text = getattr(message, "processed_plain_text", "") or getattr(message, "display_message", "") or ""
+        text = (
+            getattr(message, "processed_plain_text", "")
+            or getattr(message, "display_message", "")
+            or ""
+        )
         summary = text.strip()
         if user_name:
             return f"{user_name}: {summary}" if summary else user_name
@@ -220,7 +278,11 @@ class AnimeTraceTool(BaseTool):
             user = db_msg.user_info.user_nickname or db_msg.user_info.user_id or ""
         except Exception:
             user = ""
-        text = getattr(db_msg, "display_message", "") or getattr(db_msg, "processed_plain_text", "") or ""
+        text = (
+            getattr(db_msg, "display_message", "")
+            or getattr(db_msg, "processed_plain_text", "")
+            or ""
+        )
         summary = text.strip()
         if summary and len(summary) > 160:
             summary = summary[:157] + "..."
@@ -229,7 +291,10 @@ class AnimeTraceTool(BaseTool):
         return summary
 
     async def _pick_image_from_candidates(
-        self, candidates: List[Dict[str, Any]], image_index: int, message_id: Optional[str]
+        self,
+        candidates: List[Dict[str, Any]],
+        image_index: int,
+        message_id: Optional[str],
     ) -> str:
         if not candidates:
             raise AnimeTraceError("未找到可用的图片")
@@ -237,7 +302,9 @@ class AnimeTraceTool(BaseTool):
         if image_index < 0:
             image_index = len(candidates) + 1 + image_index
         if image_index <= 0 or image_index > len(candidates):
-            raise AnimeTraceError(f"仅找到 {len(candidates)} 张图片，请调整 image_index 参数 (1-{len(candidates)})")
+            raise AnimeTraceError(
+                f"仅找到 {len(candidates)} 张图片，请调整 image_index 参数 (1-{len(candidates)})"
+            )
         selected = candidates[image_index - 1]
         base64_data = await self._resolve_candidate_to_base64(selected["data"])
         self.logger.info(
@@ -258,17 +325,29 @@ class AnimeTraceTool(BaseTool):
 
         if len(history_candidates) == 1:
             candidate = history_candidates[0]
-            return await self._pick_image_from_candidates(candidate["candidates"], image_index, candidate["message_id"])
+            return await self._pick_image_from_candidates(
+                candidate["candidates"], image_index, candidate["message_id"]
+            )
 
-        candidate, suggested_index = await self._choose_candidate_with_llm(history_candidates)
+        candidate, suggested_index = await self._choose_candidate_with_llm(
+            history_candidates
+        )
         effective_index = image_index if image_index != 1 else suggested_index
-        return await self._pick_image_from_candidates(candidate["candidates"], effective_index, candidate["message_id"])
+        return await self._pick_image_from_candidates(
+            candidate["candidates"], effective_index, candidate["message_id"]
+        )
 
-    def _list_history_candidates(self, exclude_message_ids: set[str]) -> List[Dict[str, Any]]:
+    def _list_history_candidates(
+        self, exclude_message_ids: set[str]
+    ) -> List[Dict[str, Any]]:
         from src.plugin_system.apis import message_api
 
-        lookup_seconds = float(self.get_config("anime_trace.history_lookup_seconds", 3600) or 3600)
-        history_limit = int(self.get_config("anime_trace.history_lookup_limit", 20) or 20)
+        lookup_seconds = float(
+            self.get_config("anime_trace.history_lookup_seconds", 3600) or 3600
+        )
+        history_limit = int(
+            self.get_config("anime_trace.history_lookup_limit", 20) or 20
+        )
         now = time.time()
 
         try:
@@ -299,7 +378,15 @@ class AnimeTraceTool(BaseTool):
                     "message_id": message_id,
                     "summary": summary,
                     "timestamp": getattr(msg, "time", 0.0),
-                    "candidates": [{"data": item, "message_id": message_id, "origin": "history", "summary": summary} for item in images],
+                    "candidates": [
+                        {
+                            "data": item,
+                            "message_id": message_id,
+                            "origin": "history",
+                            "summary": summary,
+                        }
+                        for item in images
+                    ],
                     "image_count": len(images),
                 }
             )
@@ -352,7 +439,10 @@ class AnimeTraceTool(BaseTool):
 
         latest_message = self._get_latest_message()
         request_text = (
-            (getattr(latest_message, "processed_plain_text", "") or getattr(latest_message, "display_message", ""))
+            (
+                getattr(latest_message, "processed_plain_text", "")
+                or getattr(latest_message, "display_message", "")
+            )
             if latest_message
             else ""
         )
@@ -395,7 +485,9 @@ class AnimeTraceTool(BaseTool):
         except StopIteration:
             return None, None
 
-    def _build_selector_prompt(self, request_text: str, candidates: List[Dict[str, Any]]) -> str:
+    def _build_selector_prompt(
+        self, request_text: str, candidates: List[Dict[str, Any]]
+    ) -> str:
         lines = []
         for idx, item in enumerate(candidates, start=1):
             summary = item.get("summary", "") or ""
@@ -409,7 +501,7 @@ class AnimeTraceTool(BaseTool):
             f"用户当前输入：{request_block}\n"
             "以下是最近包含图片的消息列表，请选择最适合识别的消息。\n"
             f"{candidate_block}\n"
-            "请只返回一个 JSON，格式为：{\"message_id\": \"消息ID\", \"image_index\": 1}\n"
+            '请只返回一个 JSON，格式为：{"message_id": "消息ID", "image_index": 1}\n'
             "若无法判断，请选择编号最大的消息，并让 image_index=1。仅返回 JSON。"
         )
 
@@ -495,7 +587,9 @@ class AnimeTraceTool(BaseTool):
         if self._looks_like_base64(source):
             return self._normalize_base64(source)
 
-        raise AnimeTraceError("Unable to resolve image data; please make sure the image is accessible.")
+        raise AnimeTraceError(
+            "Unable to resolve image data; please make sure the image is accessible."
+        )
 
     async def _resolve_cq_image(self, source: str) -> Optional[str]:
         base64_match = re.search(r"base64=([^,\\]]+)", source)
@@ -550,15 +644,29 @@ class AnimeTraceTool(BaseTool):
         model_default = self.get_config("anime_trace.model", "animetrace_high_beta")
         min_similarity_default = self.get_config("anime_trace.min_similarity", 0.0)
 
-        is_multi = self._safe_int(function_args.get("is_multi", is_multi_default), int(is_multi_default or 1), [0, 1])
-        ai_detect = self._safe_int(function_args.get("ai_detect", ai_detect_default), int(ai_detect_default or 1), [1, 2])
-        model = str(function_args.get("model", model_default) or "").strip() or "animetrace_high_beta"
+        is_multi = self._safe_int(
+            function_args.get("is_multi", is_multi_default),
+            int(is_multi_default or 1),
+            [0, 1],
+        )
+        ai_detect = self._safe_int(
+            function_args.get("ai_detect", ai_detect_default),
+            int(ai_detect_default or 1),
+            [1, 2],
+        )
+        model = (
+            str(function_args.get("model", model_default) or "").strip()
+            or "animetrace_high_beta"
+        )
         min_similarity = self._safe_float(
-            function_args.get("min_similarity", min_similarity_default), float(min_similarity_default or 0.0)
+            function_args.get("min_similarity", min_similarity_default),
+            float(min_similarity_default or 0.0),
         )
 
         try:
-            chosen_base64 = await self._get_base64_from_context(image_index=image_index, use_reply=use_reply)
+            chosen_base64 = await self._get_base64_from_context(
+                image_index=image_index, use_reply=use_reply
+            )
         except AnimeTraceError as err:
             return {"name": self.name, "content": str(err)}
 
@@ -572,8 +680,15 @@ class AnimeTraceTool(BaseTool):
         except AnimeTraceError as err:
             return {"name": self.name, "content": f"识别失败: {err}"}
 
-        threshold = AnimeTraceClient._norm_similarity(AnimeTraceClient._as_float(min_similarity)) or 0.0
-        summary = AnimeTraceClient.format_response_text(response, min_similarity=min_similarity)
+        threshold = (
+            AnimeTraceClient._norm_similarity(
+                AnimeTraceClient._as_float(min_similarity)
+            )
+            or 0.0
+        )
+        summary = AnimeTraceClient.format_response_text(
+            response, min_similarity=min_similarity
+        )
         candidate_lines = self._build_candidate_lines(response, threshold)
 
         content_parts = [summary] if summary else ["未获得识别结果"]
@@ -593,7 +708,9 @@ class AnimeTraceTool(BaseTool):
 
         return {"name": self.name, "content": content}
 
-    def _build_candidate_lines(self, resp: Dict[str, Any], threshold: float) -> List[str]:
+    def _build_candidate_lines(
+        self, resp: Dict[str, Any], threshold: float
+    ) -> List[str]:
         data = resp.get("data")
         candidates: List[Dict[str, Any]] = []
         if isinstance(data, list):
@@ -602,7 +719,9 @@ class AnimeTraceTool(BaseTool):
             for key in ("results", "result"):
                 candidate_list = data.get(key)
                 if isinstance(candidate_list, list):
-                    candidates = [item for item in candidate_list if isinstance(item, dict)]
+                    candidates = [
+                        item for item in candidate_list if isinstance(item, dict)
+                    ]
                     break
 
         lines: List[str] = []
@@ -612,7 +731,9 @@ class AnimeTraceTool(BaseTool):
                 lines.append(line)
         return lines
 
-    def _format_candidate(self, item: Dict[str, Any], idx: int, threshold: float) -> Optional[str]:
+    def _format_candidate(
+        self, item: Dict[str, Any], idx: int, threshold: float
+    ) -> Optional[str]:
         # 角色类候选
         line = self._format_character_candidate(item, idx)
         if line:
@@ -620,7 +741,9 @@ class AnimeTraceTool(BaseTool):
         # 作品类候选
         return self._format_title_candidate(item, idx, threshold)
 
-    def _format_character_candidate(self, item: Dict[str, Any], idx: int) -> Optional[str]:
+    def _format_character_candidate(
+        self, item: Dict[str, Any], idx: int
+    ) -> Optional[str]:
         characters = item.get("character")
         if not (isinstance(characters, list) and characters):
             return None
@@ -640,7 +763,9 @@ class AnimeTraceTool(BaseTool):
             return None
         return f"{idx}. 角色候选：{'；'.join(top)}"
 
-    def _format_title_candidate(self, item: Dict[str, Any], idx: int, threshold: float) -> Optional[str]:
+    def _format_title_candidate(
+        self, item: Dict[str, Any], idx: int, threshold: float
+    ) -> Optional[str]:
         title = (
             item.get("title")
             or item.get("name")
@@ -657,7 +782,9 @@ class AnimeTraceTool(BaseTool):
             or item.get("sim")
             or item.get("confidence")
         )
-        similarity = AnimeTraceClient._norm_similarity(AnimeTraceClient._as_float(similarity_raw))
+        similarity = AnimeTraceClient._norm_similarity(
+            AnimeTraceClient._as_float(similarity_raw)
+        )
         if threshold and similarity is not None and similarity < threshold:
             return None
         extras: List[str] = []
@@ -685,8 +812,14 @@ class AnimeTraceTool(BaseTool):
         if not models:
             return None
 
-        configured_key = str(self.get_config("anime_trace.llm_model_key", "plugin_reply") or "").strip()
-        prefer_keys = [key for key in [configured_key, "plugin_reply", "replyer", "reply", "chat"] if key]
+        configured_key = str(
+            self.get_config("anime_trace.llm_model_key", "plugin_reply") or ""
+        ).strip()
+        prefer_keys = [
+            key
+            for key in [configured_key, "plugin_reply", "replyer", "reply", "chat"]
+            if key
+        ]
 
         task = None
         for key in prefer_keys:
@@ -742,81 +875,81 @@ class AnimeTracePlugin(BasePlugin):
     }
 
     config_schema: Dict[str, Dict[str, ConfigField]] = {
-    "plugin": {
-        "config_version": ConfigField(
-            type=str,
-            default="2.2.0",
-            description="配置文件版本",
-        ),
-        "enabled": ConfigField(
-            type=bool,
-            default=True,
-            description="是否启用插件",
-        ),
-    },
-    "anime_trace": {
-        "endpoint": ConfigField(
-            type=str,
-            default="https://api.animetrace.com/v1/search",
-            description="AnimeTrace 接口地址",
-        ),
-        "model": ConfigField(
-            type=str,
-            default="animetrace_high_beta",
-            description="默认识别模型",
-        ),
-        "is_multi": ConfigField(
-            type=int,
-            default=1,
-            description="是否返回多条候选（0/1）",
-        ),
-        "ai_detect": ConfigField(
-            type=int,
-            default=1,
-            description="是否开启AI图检测（1=开启，2=关闭）",
-        ),
-        "request_timeout": ConfigField(
-            type=float,
-            default=15.0,
-            description="HTTP 请求超时（秒）",
-        ),
-        "min_similarity": ConfigField(
-            type=float,
-            default=0.0,
-            description="最小相似度阈值（百分比 0–100）",
-        ),
-        "history_lookup_seconds": ConfigField(
-            type=float,
-            default=3600.0,
-            description="历史消息回溯窗口（秒）",
-        ),
-        "history_lookup_limit": ConfigField(
-            type=int,
-            default=20,
-            description="最多扫描的历史消息条数",
-        ),
-        "use_image_selector_llm": ConfigField(
-            type=bool,
-            default=True,
-            description="是否使用 LLM 选择历史消息中的图片",
-        ),
-        "image_selector_model_key": ConfigField(
-            type=str,
-            default="plugin_reply",
-            description="用于图片选择的模型键名",
-        ),
-        "use_llm": ConfigField(
-            type=bool,
-            default=False,
-            description="是否使用 LLM 总结识别结果(暂时无效)",
-        ),
-        "llm_model_key": ConfigField(
-            type=str,
-            default="plugin_reply",
-            description="用于最终结果摘要的模型键名(暂时无效)",
-        ),
-    },
-}
+        "plugin": {
+            "config_version": ConfigField(
+                type=str,
+                default="2.2.0",
+                description="配置文件版本",
+            ),
+            "enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用插件",
+            ),
+        },
+        "anime_trace": {
+            "endpoint": ConfigField(
+                type=str,
+                default="https://api.animetrace.com/v1/search",
+                description="AnimeTrace 接口地址",
+            ),
+            "model": ConfigField(
+                type=str,
+                default="animetrace_high_beta",
+                description="默认识别模型",
+            ),
+            "is_multi": ConfigField(
+                type=int,
+                default=1,
+                description="是否返回多条候选（0/1）",
+            ),
+            "ai_detect": ConfigField(
+                type=int,
+                default=1,
+                description="是否开启AI图检测（1=开启，2=关闭）",
+            ),
+            "request_timeout": ConfigField(
+                type=float,
+                default=15.0,
+                description="HTTP 请求超时（秒）",
+            ),
+            "min_similarity": ConfigField(
+                type=float,
+                default=0.0,
+                description="最小相似度阈值（百分比 0–100）",
+            ),
+            "history_lookup_seconds": ConfigField(
+                type=float,
+                default=3600.0,
+                description="历史消息回溯窗口（秒）",
+            ),
+            "history_lookup_limit": ConfigField(
+                type=int,
+                default=20,
+                description="最多扫描的历史消息条数",
+            ),
+            "use_image_selector_llm": ConfigField(
+                type=bool,
+                default=True,
+                description="是否使用 LLM 选择历史消息中的图片",
+            ),
+            "image_selector_model_key": ConfigField(
+                type=str,
+                default="plugin_reply",
+                description="用于图片选择的模型键名",
+            ),
+            "use_llm": ConfigField(
+                type=bool,
+                default=False,
+                description="是否使用 LLM 总结识别结果(暂时无效)",
+            ),
+            "llm_model_key": ConfigField(
+                type=str,
+                default="plugin_reply",
+                description="用于最终结果摘要的模型键名(暂时无效)",
+            ),
+        },
+    }
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return [
