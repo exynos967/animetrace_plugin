@@ -31,7 +31,14 @@ class AnimeTraceClient:
     支持 url/base64/file 三种输入（优先使用 url/base64）。
     """
 
-    def __init__(self, endpoint: str, timeout: float = 15.0, *, max_retries: int = 2, cache_size: int = 64) -> None:
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: float = 15.0,
+        *,
+        max_retries: int = 2,
+        cache_size: int = 64,
+    ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
         self.logger = get_logger("animetrace_client")
@@ -80,7 +87,10 @@ class AnimeTraceClient:
                 "缺少 httpx 依赖，请安装 httpx 以使用 AnimeTrace 请求"
             )
 
-        async with httpx.AsyncClient(timeout=self.timeout, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)) as client:  # type: ignore
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        ) as client:  # type: ignore
             resp = await self._post_with_retries(client, payload, files)
             # info 日志：状态码与内容长度
             try:
@@ -92,14 +102,18 @@ class AnimeTraceClient:
 
             if resp.status_code >= 400:
                 err_excerpt = await self._extract_error_excerpt(resp)
-                raise AnimeTraceError(f"HTTP 错误{err_excerpt}", status=resp.status_code)
+                raise AnimeTraceError(
+                    f"HTTP 错误{err_excerpt}", status=resp.status_code
+                )
 
             try:
                 return resp.json()  # type: ignore
             except Exception:
                 raise AnimeTraceError("响应解析失败")
 
-    async def _post_with_retries(self, client, payload: Dict[str, Any], files) -> "httpx.Response":  # type: ignore
+    async def _post_with_retries(
+        self, client, payload: Dict[str, Any], files
+    ) -> "httpx.Response":  # type: ignore
         """POST with basic retry on 429/5xx with exponential backoff."""
         attempt = 0
         while True:
@@ -110,13 +124,13 @@ class AnimeTraceClient:
                     resp = await client.post(self.endpoint, json=payload)
                 if resp.status_code in (429,) or resp.status_code >= 500:
                     if attempt < self._max_retries:
-                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        await asyncio.sleep(0.4 * (2**attempt))
                         attempt += 1
                         continue
                 return resp
             except httpx.HTTPError as e:  # type: ignore
                 if attempt < self._max_retries:
-                    await asyncio.sleep(0.4 * (2 ** attempt))
+                    await asyncio.sleep(0.4 * (2**attempt))
                     attempt += 1
                     continue
                 raise AnimeTraceError(f"网络异常: {e}")
@@ -154,7 +168,10 @@ class AnimeTraceClient:
         """下载图片字节，用于 URL → base64 或文件上传路径。"""
         if httpx is None:
             raise AnimeTraceError("缺少 httpx 依赖，无法下载图片")
-        async with httpx.AsyncClient(timeout=self.timeout, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)) as client:  # type: ignore
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        ) as client:  # type: ignore
             attempt = 0
             while True:
                 try:
@@ -165,14 +182,14 @@ class AnimeTraceClient:
                     if resp.status_code >= 400:
                         if resp.status_code in (429,) or resp.status_code >= 500:
                             if attempt < self._max_retries:
-                                await asyncio.sleep(0.4 * (2 ** attempt))
+                                await asyncio.sleep(0.4 * (2**attempt))
                                 attempt += 1
                                 continue
                         raise AnimeTraceError("下载失败", status=resp.status_code)
                     return resp.content
                 except httpx.HTTPError as e:  # type: ignore
                     if attempt < self._max_retries:
-                        await asyncio.sleep(0.4 * (2 ** attempt))
+                        await asyncio.sleep(0.4 * (2**attempt))
                         attempt += 1
                         continue
                     raise AnimeTraceError(f"下载异常: {e}")
@@ -230,7 +247,12 @@ class AnimeTraceClient:
         except Exception:
             pass
 
-        thr = AnimeTraceClient._norm_similarity(AnimeTraceClient._as_float(min_similarity)) or 0.0
+        thr = (
+            AnimeTraceClient._norm_similarity(
+                AnimeTraceClient._as_float(min_similarity)
+            )
+            or 0.0
+        )
         candidates = AnimeTraceClient._extract_candidates(resp)
 
         if candidates:
@@ -279,11 +301,21 @@ class AnimeTraceClient:
                         top.append(f"{w or ''}:{c or ''}".strip(":"))
                 except Exception:
                     continue
-            summary = "角色Top" + str(len(top)) + ": " + "; ".join(top) if top else "角色信息返回"
+            summary = (
+                "角色Top" + str(len(top)) + ": " + "; ".join(top)
+                if top
+                else "角色信息返回"
+            )
             return 0.0, summary
 
         # 通用候选
-        title = item.get("title") or item.get("name") or item.get("subject") or item.get("source") or "(未知)"
+        title = (
+            item.get("title")
+            or item.get("name")
+            or item.get("subject")
+            or item.get("source")
+            or "(未知)"
+        )
         similarity = (
             AnimeTraceClient._as_float(item.get("similarity"))
             or AnimeTraceClient._as_float(item.get("score"))
@@ -299,5 +331,7 @@ class AnimeTraceClient:
             extra.append(str(item.get("url")))
         if item.get("site"):
             extra.append(str(item.get("site")))
-        summary = f"{title}  相似度:{sim_pct:.1f}%" + (f"  ({' '.join(extra)})" if extra else "")
+        summary = f"{title}  相似度:{sim_pct:.1f}%" + (
+            f"  ({' '.join(extra)})" if extra else ""
+        )
         return sim_pct, summary
