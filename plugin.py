@@ -8,7 +8,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from maim_message import Seg
-from src.common.database.database_model import Images
+from src.common.database.database_model import Images, Messages
 from src.plugin_system import (
     BasePlugin,
     BaseTool,
@@ -28,6 +28,14 @@ class AnimeTraceTool(BaseTool):
     """Tool wrapper that sends images to AnimeTrace for recognition."""
 
     name: str = "anime_trace_search"
+    NAPCAT_IMAGE_SOURCE_KEY = "napcat_image_sources"
+    CURRENT_IMAGE_BUCKET = "current_images"
+    REPLY_IMAGE_BUCKET = "reply_images"
+    FORWARD_IMAGE_BUCKET = "forward_images"
+    CQ_REPLY_PATTERN = re.compile(r"\[CQ:reply,[^\]]*id=([^,\]]+)[^\]]*\]")
+    CQ_IMAGE_PATTERN = re.compile(r"\[CQ:image[^\]]+\]")
+    PICID_PATTERN = re.compile(r"\[picid:[^\]]+\]")
+    URL_PATTERN = re.compile(r"(https?://\S+)")
     description: str = (
         "Recognise anime images via AnimeTrace and return likely works or characters."
     )
@@ -136,15 +144,32 @@ class AnimeTraceTool(BaseTool):
         exclude_ids: set[str] = set()
 
         # 1 优先使用引用消息
-        if use_reply and message and getattr(message, "reply", None):
-            reply_candidates = self._extract_images_from_message(
-                message.reply, origin="reply"
-            )
+        if use_reply and message:
+            if getattr(message, "reply", None):
+                reply_candidates = self._extract_images_from_message(
+                    message.reply, origin="reply"
+                )
+                if reply_candidates:
+                    return await self._pick_image_from_candidates(
+                        reply_candidates,
+                        image_index,
+                        getattr(message.reply.message_info, "message_id", None),
+                    )
+
+            reply_candidates = self._extract_reply_images_from_message(message)
             if reply_candidates:
                 return await self._pick_image_from_candidates(
                     reply_candidates,
                     image_index,
-                    getattr(message.reply.message_info, "message_id", None),
+                    getattr(message.message_info, "message_id", None),
+                )
+
+            history_reply_candidates = self._extract_reply_images_from_history(message)
+            if history_reply_candidates:
+                return await self._pick_image_from_candidates(
+                    history_reply_candidates,
+                    image_index,
+                    getattr(message.message_info, "message_id", None),
                 )
 
         # 2) 使用当前消息
@@ -178,6 +203,12 @@ class AnimeTraceTool(BaseTool):
         items: List[str] = []
         if message is None:
             return []
+        items.extend(
+            self._extract_image_candidates_from_additional_config(
+                self._get_message_additional_config(message),
+                self._get_buckets_for_origin(origin),
+            )
+        )
         self._collect_images_from_any(getattr(message, "message_segment", None), items)
         raw_message = getattr(message, "raw_message", None)
         if isinstance(raw_message, str):
@@ -197,6 +228,161 @@ class AnimeTraceTool(BaseTool):
             }
             for item in unique_items
         ]
+
+    def _extract_reply_images_from_message(self, message) -> List[Dict[str, Any]]:
+        items = self._extract_image_candidates_from_additional_config(
+            self._get_message_additional_config(message),
+            [self.REPLY_IMAGE_BUCKET],
+        )
+        unique_items = self._unique_candidates(items)
+        if not unique_items:
+            return []
+
+        message_id = None
+        if getattr(message, "message_info", None):
+            message_id = getattr(message.message_info, "message_id", None)
+        summary = self._build_message_summary(message)
+        return [
+            {
+                "data": item,
+                "message_id": message_id,
+                "origin": "reply",
+                "summary": summary,
+            }
+            for item in unique_items
+        ]
+
+    def _extract_reply_images_from_history(self, message) -> List[Dict[str, Any]]:
+        for reply_message_id in self._extract_reply_ids_from_message(message):
+            db_message = self._get_db_message_by_id(reply_message_id)
+            if db_message is None:
+                continue
+
+            images = self._extract_images_from_db_message(db_message)
+            if not images:
+                continue
+
+            summary = self._build_db_message_summary(db_message)
+            return [
+                {
+                    "data": item,
+                    "message_id": reply_message_id,
+                    "origin": "reply_history",
+                    "summary": summary,
+                }
+                for item in images
+            ]
+        return []
+
+    def _extract_reply_ids_from_message(self, message) -> List[str]:
+        reply_ids: List[str] = []
+        if message is None:
+            return reply_ids
+
+        self._collect_reply_ids_from_any(getattr(message, "message_segment", None), reply_ids)
+        raw_message = getattr(message, "raw_message", None)
+        if isinstance(raw_message, str):
+            self._collect_reply_ids_from_any(raw_message, reply_ids)
+        return self._unique_texts(reply_ids)
+
+    def _collect_reply_ids_from_any(self, obj: Any, out: List[str]) -> None:
+        if obj is None:
+            return
+        if isinstance(obj, Seg):
+            seg_type = getattr(obj, "type", "")
+            data = getattr(obj, "data", None)
+            if seg_type == "reply":
+                self._append_reply_id(data, out)
+            if isinstance(data, (list, dict, str)):
+                self._collect_reply_ids_from_any(data, out)
+            return
+        if isinstance(obj, list):
+            for item in obj:
+                self._collect_reply_ids_from_any(item, out)
+            return
+        if isinstance(obj, dict):
+            if obj.get("type") == "reply":
+                self._append_reply_id(obj.get("data"), out)
+            for key in ("message_segment", "message", "data", "content", "segments"):
+                if key in obj:
+                    self._collect_reply_ids_from_any(obj[key], out)
+            return
+        if isinstance(obj, str):
+            for reply_id in self.CQ_REPLY_PATTERN.findall(obj):
+                self._append_reply_id(reply_id, out)
+
+    def _append_reply_id(self, value: Any, out: List[str]) -> None:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("message_id") or value.get("text")
+        if not isinstance(value, str):
+            return
+        reply_id = value.strip()
+        if reply_id:
+            out.append(reply_id)
+
+    def _unique_texts(self, items: List[str]) -> List[str]:
+        seen: set[str] = set()
+        unique_items: List[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            unique_items.append(item)
+        return unique_items
+
+    def _get_db_message_by_id(self, message_id: str):
+        if not message_id:
+            return None
+
+        try:
+            query = Messages.select().where(Messages.message_id == message_id)
+            if self.chat_stream and getattr(self.chat_stream, "stream_id", None):
+                query = query.where(Messages.chat_id == self.chat_stream.stream_id)
+            return query.order_by(Messages.time.desc()).first()
+        except Exception as err:
+            self.logger.error(f"通过 message_id 查询历史消息失败: {err}")
+            return None
+
+    def _get_message_additional_config(self, message) -> Any:
+        if not getattr(message, "message_info", None):
+            return None
+        return getattr(message.message_info, "additional_config", None)
+
+    def _get_buckets_for_origin(self, origin: str) -> List[str]:
+        if origin == "reply":
+            return [self.REPLY_IMAGE_BUCKET]
+        return [self.CURRENT_IMAGE_BUCKET, self.FORWARD_IMAGE_BUCKET]
+
+    def _extract_image_candidates_from_additional_config(
+        self, payload: Any, buckets: List[str]
+    ) -> List[str]:
+        config = self._normalize_additional_config(payload)
+        if not isinstance(config, dict):
+            return []
+
+        source_root = config.get(self.NAPCAT_IMAGE_SOURCE_KEY)
+        if not isinstance(source_root, dict):
+            return []
+
+        items: List[str] = []
+        for bucket in buckets:
+            entries = source_root.get(bucket)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("url", "path", "file", "base64"):
+                    self._append_candidate(entry.get(key), items)
+        return items
+
+    def _normalize_additional_config(self, payload: Any) -> Any:
+        if isinstance(payload, str):
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                return None
+        return payload
 
     def _collect_images_from_any(self, obj: Any, out: List[str]) -> None:
         """Dispatch image extraction by type to reduce branching complexity."""
@@ -245,7 +431,23 @@ class AnimeTraceTool(BaseTool):
                 self._collect_images_from_any(obj[key], out)
 
     def _handle_str(self, s: str, out: List[str]) -> None:
-        self._append_candidate(s, out)
+        text = s.strip()
+        if not text:
+            return
+
+        extracted = self._extract_candidates_from_text(text)
+        if extracted:
+            for item in extracted:
+                self._append_candidate(item, out)
+            if (
+                text.startswith("data:")
+                or text.startswith("base64://")
+                or self._looks_like_base64(text)
+            ):
+                self._append_candidate(text, out)
+            return
+
+        self._append_candidate(text, out)
 
     def _unique_candidates(self, items: List[str]) -> List[str]:
         seen: set[str] = set()
@@ -256,7 +458,57 @@ class AnimeTraceTool(BaseTool):
                 continue
             seen.add(key)
             ordered.append(item)
-        return ordered
+        return self._sort_candidates(ordered)
+
+    def _extract_candidates_from_text(self, text: str) -> List[str]:
+        extracted: List[str] = []
+        remainder = text
+
+        cq_images = self.CQ_IMAGE_PATTERN.findall(remainder)
+        if cq_images:
+            extracted.extend(cq_images)
+            remainder = self.CQ_IMAGE_PATTERN.sub(" ", remainder)
+
+        picids = self.PICID_PATTERN.findall(remainder)
+        if picids:
+            extracted.extend(picids)
+            remainder = self.PICID_PATTERN.sub(" ", remainder)
+
+        urls = [
+            self._clean_url_candidate(match)
+            for match in self.URL_PATTERN.findall(remainder)
+        ]
+        extracted.extend(url for url in urls if url)
+        return extracted
+
+    @staticmethod
+    def _clean_url_candidate(value: str) -> str:
+        return value.rstrip('.,!?)]}"\'')
+
+    def _sort_candidates(self, items: List[str]) -> List[str]:
+        ranked = sorted(
+            enumerate(items),
+            key=lambda entry: (self._candidate_priority(entry[1]), entry[0]),
+        )
+        return [item for _, item in ranked]
+
+    def _candidate_priority(self, candidate: str) -> int:
+        value = candidate.strip()
+        if not value:
+            return 99
+        if value.startswith("[CQ:image"):
+            if "url=" in value or "file=http://" in value or "file=https://" in value:
+                return 0
+            return 1
+        if value.startswith("http://") or value.startswith("https://"):
+            return 0
+        if "[picid:" in value or os.path.exists(value):
+            return 2
+        if value.startswith("data:") or value.startswith("base64://"):
+            return 4
+        if self._looks_like_base64(value):
+            return 5
+        return 3
 
     def _build_message_summary(self, message) -> str:
         info = getattr(message, "message_info", None)
@@ -404,8 +656,18 @@ class AnimeTraceTool(BaseTool):
         if not config_str:
             return images
         try:
-            payload = json.loads(config_str)
+            payload = self._normalize_additional_config(config_str)
             if isinstance(payload, dict):
+                images.extend(
+                    self._extract_image_candidates_from_additional_config(
+                        payload,
+                        [
+                            self.CURRENT_IMAGE_BUCKET,
+                            self.REPLY_IMAGE_BUCKET,
+                            self.FORWARD_IMAGE_BUCKET,
+                        ],
+                    )
+                )
                 seg_dict = payload.get("message_segment")
                 if isinstance(seg_dict, dict):
                     seg = Seg.from_dict(seg_dict)
@@ -583,6 +845,9 @@ class AnimeTraceTool(BaseTool):
             remote_base64 = await self.client.url_to_base64(source)
             return self._normalize_base64(remote_base64)
 
+        if os.path.exists(source):
+            return self._file_to_base64(source)
+
         # raw base64
         if self._looks_like_base64(source):
             return self._normalize_base64(source)
@@ -607,6 +872,8 @@ class AnimeTraceTool(BaseTool):
             if file_value.startswith("http://") or file_value.startswith("https://"):
                 remote_base64 = await self.client.url_to_base64(file_value)
                 return self._normalize_base64(remote_base64)
+            if os.path.exists(file_value):
+                return self._file_to_base64(file_value)
         return None
 
     async def _resolve_url_or_base64(self, source: str) -> Optional[str]:
@@ -624,13 +891,17 @@ class AnimeTraceTool(BaseTool):
             path = getattr(image, "path", "") or ""
             if not path or not os.path.exists(path):
                 raise AnimeTraceError(f"Image file missing for picid: {image_id}")
-            with open(path, "rb") as fh:
-                data = fh.read()
-            return base64.b64encode(data).decode("utf-8")
+            return self._file_to_base64(path)
         except AnimeTraceError:
             raise
         except Exception as exc:
             raise AnimeTraceError(f"Failed to load image for picid {image_id}: {exc}")
+
+    @staticmethod
+    def _file_to_base64(path: str) -> str:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        return base64.b64encode(data).decode("utf-8")
 
     async def execute(self, function_args: Dict[str, Any]) -> Dict[str, str]:
         use_reply = self._safe_bool(function_args.get("use_reply", False), False)
